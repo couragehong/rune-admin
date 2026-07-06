@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/CryptoLabInc/rune-admin/vault/internal/crypto"
+	"github.com/CryptoLabInc/rune-admin/vault/internal/rbac"
 	"github.com/CryptoLabInc/rune-admin/vault/internal/tokens"
 	pb "github.com/CryptoLabInc/rune-admin/vault/pkg/vaultpb"
 )
@@ -26,6 +27,7 @@ type Vault struct {
 	tokens *tokens.Store
 	engine *crypto.Engine
 	audit  *AuditLogger
+	rbac   *rbac.Store // nil when rbac.enabled is false
 
 	bundleParams crypto.KeysParams
 }
@@ -49,6 +51,12 @@ func defaultKeyID(_ *Config) string { return "vault-key" }
 
 // Tokens exposes the token store for the admin UDS server.
 func (v *Vault) Tokens() *tokens.Store { return v.tokens }
+
+// SetRBAC attaches the rbac store (nil leaves enforcement disabled).
+func (v *Vault) SetRBAC(s *rbac.Store) { v.rbac = s }
+
+// RBAC exposes the rbac store for the admin UDS server; nil when disabled.
+func (v *Vault) RBAC() *rbac.Store { return v.rbac }
 
 // Config exposes the resolved config.
 func (v *Vault) Config() *Config { return v.cfg }
@@ -161,7 +169,41 @@ func (s *VaultGRPC) Insert(ctx context.Context, req *pb.InsertRequest) (*pb.Inse
 		return &pb.InsertResponse{Error: msg}, status.Error(codes.Internal, msg)
 	}
 
-	sealed, err := s.sealMeta(req.GetToken(), req.GetMetadata())
+	meta := req.GetMetadata()
+	if rb := s.v.rbac; rb != nil {
+		// A-plan enforcement: the capture target is the member's default
+		// group; the authenticated identity and group are stamped into the
+		// metadata before sealing (the blind index never sees them).
+		group, err := rb.DefaultGroup(username)
+		if err != nil {
+			statusStr = "error"
+			msg := err.Error()
+			errDetail = &msg
+			return &pb.InsertResponse{Error: msg}, status.Error(codes.Internal, msg)
+		}
+		if group == "" {
+			statusStr = "denied"
+			msg := "rbac: user " + username + " has no default capture group (runevault rbac member-add)"
+			errDetail = &msg
+			return &pb.InsertResponse{Error: msg}, status.Error(codes.PermissionDenied, msg)
+		}
+		ok, err := rb.Allowed(username, group, rbac.VerbWrite)
+		if err != nil {
+			statusStr = "error"
+			msg := err.Error()
+			errDetail = &msg
+			return &pb.InsertResponse{Error: msg}, status.Error(codes.Internal, msg)
+		}
+		if !ok {
+			statusStr = "denied"
+			msg := "rbac: user " + username + " lacks write on the target group"
+			errDetail = &msg
+			return &pb.InsertResponse{Error: msg}, status.Error(codes.PermissionDenied, msg)
+		}
+		meta = stampRBACMeta(meta, group, username)
+	}
+
+	sealed, err := s.sealMeta(req.GetToken(), meta)
 	if err != nil {
 		statusStr = "error"
 		msg := err.Error()
@@ -230,9 +272,30 @@ func (s *VaultGRPC) Search(ctx context.Context, req *pb.SearchRequest) (*pb.Sear
 		errDetail = &msg
 		return &pb.SearchResponse{Error: msg}, status.Error(codes.Internal, msg)
 	}
+	// A-plan enforcement: drop hits whose stamped group is outside the
+	// caller's read scope. Records without a stamp are legacy-public.
+	// MVP note: no over-fetch — filtering can only shrink the top-k page.
+	var readScope map[string]struct{}
+	if rb := s.v.rbac; rb != nil {
+		readScope, err = rb.ScopeOf(username, rbac.VerbRead)
+		if err != nil {
+			statusStr = "error"
+			msg := err.Error()
+			errDetail = &msg
+			return &pb.SearchResponse{Error: msg}, status.Error(codes.Internal, msg)
+		}
+	}
 	out := make([]*pb.SearchHit, 0, len(hits))
 	for _, h := range hits {
-		out = append(out, &pb.SearchHit{Id: h.ID, Score: h.Score, Metadata: s.openMeta(h.Metadata)})
+		opened := s.openMeta(h.Metadata)
+		if s.v.rbac != nil {
+			if g := rbacGroupOf(opened); g != "" {
+				if _, ok := readScope[g]; !ok {
+					continue
+				}
+			}
+		}
+		out = append(out, &pb.SearchHit{Id: h.ID, Score: h.Score, Metadata: opened})
 	}
 	resultCount = len(out)
 	return &pb.SearchResponse{Hits: out}, nil

@@ -32,6 +32,7 @@ type Config struct {
 	Envector EnvectorConfig `yaml:"envector"`
 	Tokens   TokensConfig   `yaml:"tokens"`
 	Audit    AuditConfig    `yaml:"audit"`
+	RBAC     RBACConfig     `yaml:"rbac"`
 
 	// Source records where this Config was loaded from (resolved absolute
 	// path), populated by LoadConfig. Empty for in-memory test configs.
@@ -87,6 +88,15 @@ type TokensConfig struct {
 type AuditConfig struct {
 	Mode string `yaml:"mode"`
 	Path string `yaml:"path"`
+}
+
+// RBACConfig enables group-scoped access control (internal/rbac). When
+// Enabled, DBPath points at the SQLite database holding groups, members and
+// grants; Insert stamps the author's default group into sealed metadata and
+// Search filters hits by the caller's read scope.
+type RBACConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	DBPath  string `yaml:"db_path"`
 }
 
 // LoadConfig resolves the config path (caller override → ConfigLookupPaths)
@@ -242,6 +252,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Tokens.TokensFile == "" {
 		errs = append(errs, "tokens.tokens_file is required")
+	}
+	if c.RBAC.Enabled && c.RBAC.DBPath == "" {
+		errs = append(errs, "rbac.db_path is required when rbac.enabled is true")
 	}
 	if len(errs) > 0 {
 		return errors.New("config invalid:\n  - " + strings.Join(errs, "\n  - "))

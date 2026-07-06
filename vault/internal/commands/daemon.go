@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/CryptoLabInc/rune-admin/vault/internal/crypto"
+	"github.com/CryptoLabInc/rune-admin/vault/internal/rbac"
 	"github.com/CryptoLabInc/rune-admin/vault/internal/server"
 	"github.com/CryptoLabInc/rune-admin/vault/internal/tokens"
 )
@@ -79,6 +80,16 @@ func runDaemonStart(ctx context.Context) error {
 
 	v := server.NewVault(cfg, store, eng, audit)
 	defer v.Close()
+
+	if cfg.RBAC.Enabled {
+		rb, err := rbac.Open(cfg.RBAC.DBPath)
+		if err != nil {
+			return fmt.Errorf("daemon: open rbac store: %w", err)
+		}
+		defer rb.Close()
+		v.SetRBAC(rb)
+		slog.Info("vault: rbac enforcement enabled", "db", cfg.RBAC.DBPath)
+	}
 
 	slog.Info("vault: starting daemon",
 		"pid", os.Getpid(),

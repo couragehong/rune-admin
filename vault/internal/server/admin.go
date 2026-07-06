@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/CryptoLabInc/rune-admin/vault/internal/rbac"
 	"github.com/CryptoLabInc/rune-admin/vault/internal/tokens"
 )
 
@@ -232,12 +233,252 @@ func buildAdminMux(v *Vault) http.Handler {
 		})
 	})
 
+	registerRBACRoutes(mux, v)
+
 	// 404 fallback for routes that didn't match.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("No route for %s %s", r.Method, r.URL.Path))
 	})
 
 	return mux
+}
+
+// registerRBACRoutes wires the group/member/grant admin surface. Every route
+// answers 409 when rbac is disabled so the CLI can print a clear hint.
+func registerRBACRoutes(mux *http.ServeMux, v *Vault) {
+	requireRBAC := func(w http.ResponseWriter) *rbac.Store {
+		rb := v.RBAC()
+		if rb == nil {
+			writeError(w, http.StatusConflict, "rbac is disabled (set rbac.enabled + rbac.db_path in runevault.conf)")
+		}
+		return rb
+	}
+
+	mux.HandleFunc("GET /rbac/groups", func(w http.ResponseWriter, r *http.Request) {
+		rb := requireRBAC(w)
+		if rb == nil {
+			return
+		}
+		groups, err := rb.ListGroups()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"groups": groups})
+	})
+
+	mux.HandleFunc("POST /rbac/groups", func(w http.ResponseWriter, r *http.Request) {
+		rb := requireRBAC(w)
+		if rb == nil {
+			return
+		}
+		var body struct {
+			Name       string `json:"name"`
+			Parent     string `json:"parent"`
+			CopyParent bool   `json:"copy_parent"`
+		}
+		if err := readJSON(r, &body); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if body.Name == "" {
+			writeError(w, http.StatusBadRequest, "Missing required field: name")
+			return
+		}
+		parentID := ""
+		if body.Parent != "" {
+			pg, err := rb.ResolveGroup(body.Parent)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			parentID = pg.ID
+		}
+		g, plan, err := rb.CreateGroup(body.Name, parentID, body.CopyParent)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]any{"group": g, "copied": plan.Changes})
+	})
+
+	mux.HandleFunc("GET /rbac/members", func(w http.ResponseWriter, r *http.Request) {
+		rb := requireRBAC(w)
+		if rb == nil {
+			return
+		}
+		members, err := rb.ListMembers()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"members": members})
+	})
+
+	mux.HandleFunc("POST /rbac/members", func(w http.ResponseWriter, r *http.Request) {
+		rb := requireRBAC(w)
+		if rb == nil {
+			return
+		}
+		var body struct {
+			ID           string `json:"id"`
+			DefaultGroup string `json:"default_group"`
+		}
+		if err := readJSON(r, &body); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if body.ID == "" {
+			writeError(w, http.StatusBadRequest, "Missing required field: id")
+			return
+		}
+		defaultGroupID := ""
+		if body.DefaultGroup != "" {
+			g, err := rb.ResolveGroup(body.DefaultGroup)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			defaultGroupID = g.ID
+		}
+		if err := rb.EnsureMember(body.ID, defaultGroupID); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]string{"id": body.ID, "default_group": defaultGroupID})
+	})
+
+	mux.HandleFunc("GET /rbac/grants", func(w http.ResponseWriter, r *http.Request) {
+		rb := requireRBAC(w)
+		if rb == nil {
+			return
+		}
+		groupID := ""
+		if g := r.URL.Query().Get("group"); g != "" {
+			gr, err := rb.ResolveGroup(g)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			groupID = gr.ID
+		}
+		grants, err := rb.Grants(r.URL.Query().Get("member"), groupID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"grants": grants})
+	})
+
+	mux.HandleFunc("POST /rbac/invite", func(w http.ResponseWriter, r *http.Request) {
+		rb := requireRBAC(w)
+		if rb == nil {
+			return
+		}
+		var body struct {
+			Member string `json:"member"`
+			Group  string `json:"group"`
+			Role   string `json:"role"`
+			DryRun bool   `json:"dry_run"`
+		}
+		if err := readJSON(r, &body); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if body.Member == "" || body.Group == "" || body.Role == "" {
+			writeError(w, http.StatusBadRequest, "Missing required fields: member, group, role")
+			return
+		}
+		g, err := rb.ResolveGroup(body.Group)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		plan, err := rb.PlanInvite(body.Member, g.ID, body.Role)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		applied := false
+		if !body.DryRun {
+			if err := rb.Apply(plan); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			applied = true
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"plan": plan, "applied": applied})
+	})
+
+	mux.HandleFunc("POST /rbac/remove", func(w http.ResponseWriter, r *http.Request) {
+		rb := requireRBAC(w)
+		if rb == nil {
+			return
+		}
+		var body struct {
+			Member  string `json:"member"`
+			Group   string `json:"group"`
+			Cascade bool   `json:"cascade"`
+			DryRun  bool   `json:"dry_run"`
+		}
+		if err := readJSON(r, &body); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if body.Member == "" || body.Group == "" {
+			writeError(w, http.StatusBadRequest, "Missing required fields: member, group")
+			return
+		}
+		g, err := rb.ResolveGroup(body.Group)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		plan, err := rb.PlanRemove(body.Member, g.ID, body.Cascade)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		applied := false
+		if !body.DryRun {
+			if err := rb.Apply(plan); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			applied = true
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"plan": plan, "applied": applied})
+	})
+
+	mux.HandleFunc("GET /rbac/scope", func(w http.ResponseWriter, r *http.Request) {
+		rb := requireRBAC(w)
+		if rb == nil {
+			return
+		}
+		member := r.URL.Query().Get("member")
+		if member == "" {
+			writeError(w, http.StatusBadRequest, "Missing required query param: member")
+			return
+		}
+		verbName := r.URL.Query().Get("verb")
+		if verbName == "" {
+			verbName = "read"
+		}
+		verb, ok := map[string]rbac.Verb{
+			"read": rbac.VerbRead, "write": rbac.VerbWrite,
+			"delete": rbac.VerbDelete, "manage": rbac.VerbManage,
+		}[verbName]
+		if !ok {
+			writeError(w, http.StatusBadRequest, "verb must be one of read|write|delete|manage")
+			return
+		}
+		names, err := rb.ScopeNames(member, verb)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"member": member, "verb": verbName, "groups": names})
+	})
 }
 
 func tokenJSON(t *tokens.Token) map[string]any {
