@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"time"
+	"unicode/utf8"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"
@@ -289,6 +290,11 @@ func (s *VaultGRPC) Search(ctx context.Context, req *pb.SearchRequest) (*pb.Sear
 	for _, h := range hits {
 		opened := s.openMeta(h.Metadata)
 		if s.v.rbac != nil {
+			// A record we cannot open (sealed under a different team_secret)
+			// is not ours — drop it rather than leak an opaque hit.
+			if h.Metadata != "" && opened == "" {
+				continue
+			}
 			if g := rbacGroupOf(opened); g != "" {
 				if _, ok := readScope[g]; !ok {
 					continue
@@ -343,6 +349,13 @@ func (s *VaultGRPC) openMeta(stored string) string {
 	pt, err := crypto.DecryptMetadata(env.Cipher, dek)
 	if err != nil {
 		return stored
+	}
+	// AES-CTR is unauthenticated: decrypting with the wrong DEK (e.g. a record
+	// sealed by a different team_secret) yields garbage rather than an error.
+	// Guard the caller — never return bytes that would break a protobuf string
+	// field or read as our JSON. Invalid UTF-8 => treat as unreadable.
+	if !utf8.Valid(pt) {
+		return ""
 	}
 	return string(pt)
 }

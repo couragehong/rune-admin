@@ -410,6 +410,42 @@ func registerRBACRoutes(mux *http.ServeMux, v *Vault) {
 		writeJSON(w, http.StatusOK, map[string]any{"plan": plan, "applied": applied})
 	})
 
+	mux.HandleFunc("POST /rbac/grant", func(w http.ResponseWriter, r *http.Request) {
+		rb := requireRBAC(w)
+		if rb == nil {
+			return
+		}
+		var body struct {
+			Member string `json:"member"`
+			Group  string `json:"group"`
+			Role   string `json:"role"`
+		}
+		if err := readJSON(r, &body); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if body.Member == "" || body.Group == "" || !rbac.ValidRole(body.Role) {
+			writeError(w, http.StatusBadRequest, "member, group, and a valid role (read|write|edit|admin) are required")
+			return
+		}
+		g, err := rb.ResolveGroup(body.Group)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		// Single-row override: set this (member, group) role without touching
+		// descendants — the intentional-override primitive behind the inline
+		// role dropdown.
+		if err := rb.Apply(rbac.Plan{
+			Reason:  "grant-override",
+			Changes: []rbac.Change{{Op: "update", MemberID: body.Member, GroupID: g.ID, GroupName: g.Name, Role: body.Role}},
+		}); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"member": body.Member, "group": g.ID, "role": body.Role})
+	})
+
 	mux.HandleFunc("POST /rbac/remove", func(w http.ResponseWriter, r *http.Request) {
 		rb := requireRBAC(w)
 		if rb == nil {
